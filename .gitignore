@@ -1,0 +1,11 @@
+# Virtual environment
+.venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Test and build output
+.pytest_cache/
+build/
+dist/

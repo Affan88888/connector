@@ -1,0 +1,19 @@
+[project]
+name = "connector"
+version = "0.1.0"
+description = "Tool for connecting devices for quickly sending links"
+readme = "README.md"
+authors = [
+    { name = "Affan88888", email = "affankapidzic3@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "zeroconf>=0.151.5",
+]
+
+[project.scripts]
+connector = "connector:main"
+
+[build-system]
+requires = ["uv_build>=0.12.21,<0.13.0"]
+build-backend = "uv_build"
