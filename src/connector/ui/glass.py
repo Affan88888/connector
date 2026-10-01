@@ -1,0 +1,450 @@
+"""See-through glass windows.
+
+A GlassWindow grabs the part of the screen behind it, blurs it lightly and
+paints it as its own background. For that grab to show what's behind the
+window rather than the window itself, the window is left out of screen
+captures. Only Windows supports that for now; elsewhere the glass falls back
+to an opaque background.
+
+A GlassWindow can also be dragged anywhere on the screen with the mouse.
+"""
+
+import ctypes
+import sys
+from typing import Literal
+
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QGuiApplication,
+    QImage,
+    QLinearGradient,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QRegion,
+)
+from PySide6.QtWidgets import QGraphicsBlurEffect, QGraphicsPixmapItem, QGraphicsScene, QWidget
+
+from connector.ui.style import ON_DARK, ON_LIGHT, RADIUS, Theme, luminance, theme_for_system
+
+Edge = Literal["left", "right"]
+
+CAPTURE_INTERVAL_MS = 125  # refresh the view of what's behind, 8 times a second
+REFRACTION = 8  # px of the surroundings bent in at the edges
+BLUR_RADIUS = 6  # blur strength, applied at half size
+BLUR_PAD = 12  # extra px grabbed so the blur has real pixels to sample at the edges
+
+_WDA_EXCLUDEFROMCAPTURE = 0x11
+# Older Windows 10 builds accept the call but black the window out in captures
+# instead of leaving it out, which would turn the glass black.
+_MIN_WINDOWS_BUILD = 19041  # Windows 10, version 2004
+_DWMWA_TRANSITIONS_FORCEDISABLED = 3
+
+
+def exclude_from_capture(widget: QWidget) -> bool:
+    """Leave a top-level widget out of all screen captures. Returns True if it worked."""
+    if sys.platform != "win32" or sys.getwindowsversion().build < _MIN_WINDOWS_BUILD:
+        return False
+
+    from ctypes import wintypes
+
+    hwnd = wintypes.HWND(int(widget.winId()))
+    try:
+        return bool(ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, _WDA_EXCLUDEFROMCAPTURE))
+    except (AttributeError, OSError):
+        return False
+
+
+def disable_window_animations(widget: QWidget) -> None:
+    """Turn off Windows' own fade when a window is shown or hidden.
+
+    We animate the windows ourselves, and a screen grab taken while Windows
+    is still fading a window waits for the fade to finish (~300 ms).
+    """
+    if sys.platform != "win32":
+        return
+
+    from ctypes import wintypes
+
+    hwnd = wintypes.HWND(int(widget.winId()))
+    disabled = ctypes.c_int(1)
+    try:
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, _DWMWA_TRANSITIONS_FORCEDISABLED, ctypes.byref(disabled), ctypes.sizeof(disabled)
+        )
+    except (AttributeError, OSError):
+        pass
+
+
+def blur(image: QImage, radius: float) -> QImage:
+    """Blur an image with Qt's own blur effect.
+
+    QGraphicsBlurEffect only works on items in a QGraphicsScene, so the image
+    goes into a throwaway scene, which is then rendered into a new image.
+    """
+    item = QGraphicsPixmapItem(QPixmap.fromImage(image))
+    effect = QGraphicsBlurEffect()
+    effect.setBlurRadius(radius)
+    effect.setBlurHints(QGraphicsBlurEffect.BlurHint.QualityHint)
+    item.setGraphicsEffect(effect)
+    scene = QGraphicsScene()
+    scene.addItem(item)
+
+    result = QImage(image.size(), QImage.Format.Format_ARGB32_Premultiplied)
+    result.fill(Qt.GlobalColor.transparent)
+    p = QPainter(result)
+    scene.render(p, QRectF(result.rect()), QRectF(image.rect()))
+    p.end()
+    return result
+
+
+class GlassWindow(QWidget):
+    """A frameless, always-on-top window with see-through glass behind its
+    contents, which you can drag anywhere on the screen."""
+
+    MOVABLE = True  # subclasses set this to False to opt out of dragging
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            # Clicking the widget shouldn't take keyboard focus away from
+            # the app you're typing in.
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        # Our paintEvent decides every pixel, including see-through ones.
+        # Must be set before the native window exists.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        self.theme = theme_for_system()
+        self.sliding = False  # True while SideDock animates us; no captures then
+        self._clip: QRect | None = None  # while sliding, only this part of the desktop shows us
+        self._backdrop: QImage | None = None  # blurred view of what's behind
+
+        # Dragging: where the mouse was pressed, and whether it became a drag.
+        self._press_global: QPoint | None = None
+        self._press_pos = QPoint()
+        self._dragging = False
+        # While dragging, one blurred picture of the whole screen. Each step
+        # of the drag cuts the right piece out of it instead of grabbing the
+        # screen again, which would be too slow to keep up with the mouse.
+        self._snapshot: QImage | None = None
+        self._snapshot_screen = ""  # name of the screen it was taken on
+
+        self._capture_timer = QTimer(self)
+        self._capture_timer.setInterval(CAPTURE_INTERVAL_MS)
+        self._capture_timer.timeout.connect(self._on_capture_timer)
+
+        QGuiApplication.styleHints().colorSchemeChanged.connect(self._on_scheme_changed)
+
+        # winId() inside creates the native window now, so it's left out of
+        # captures before it's ever shown. Creating it already sends a
+        # moveEvent, which reads _live, hence the False first.
+        self._live = False
+        self._live = exclude_from_capture(self)
+        disable_window_animations(self)
+
+    # --- position -------------------------------------------------------
+
+    def clamped(self, pos: QPoint, area: QRect | None = None) -> QPoint:
+        """`pos`, nudged so the whole window stays inside `area`
+        (by default the usable area of the window's screen)."""
+        if area is None:
+            area = self.screen().availableGeometry()
+        x = min(max(pos.x(), area.x()), area.x() + area.width() - self.width())
+        y = min(max(pos.y(), area.y()), area.y() + area.height() - self.height())
+        return QPoint(x, y)
+
+    def nearest_edge(self) -> Edge:
+        """The side edge of the screen, left or right, closest to the window's middle."""
+        area = self.screen().availableGeometry()
+        return "left" if self.geometry().center().x() < area.center().x() else "right"
+
+    def set_sliding(self, sliding: bool, clip: QRect | None = None) -> None:
+        """Called by SideDock around its animations.
+
+        Capturing takes ~15 ms, longer than one animation frame, so it's
+        paused while sliding and done once the window has landed. With
+        `clip`, any part of the window outside that area isn't drawn, so it
+        disappears behind the screen edge instead of showing up on a monitor
+        next to it.
+        """
+        self.sliding = sliding
+        self._clip = clip if sliding else None
+        if sliding:
+            self._apply_clip()
+        else:
+            self.clearMask()
+            if self.isVisible():
+                self.refresh_backdrop()
+
+    def _apply_clip(self) -> None:
+        if self._clip is None:
+            return
+        visible = self.geometry().intersected(self._clip).translated(-self.pos())
+        if visible.isEmpty():
+            # An empty mask means "no mask" to Qt, which would show the whole
+            # window. A 1 px rect just outside it shows nothing instead.
+            visible = QRect(-1, -1, 1, 1)
+        self.setMask(QRegion(visible))
+
+    # --- shape and theme ------------------------------------------------
+
+    def glass_shape(self, rect: QRectF) -> QPainterPath:
+        """The outline of the glass. Subclasses can override it."""
+        path = QPainterPath()
+        path.addRoundedRect(rect, RADIUS, RADIUS)
+        return path
+
+    def set_theme(self, theme: Theme) -> None:
+        if theme is self.theme:
+            return
+        self.theme = theme
+        self.on_theme_changed()
+        self.update()
+
+    def on_theme_changed(self) -> None:
+        """Called after the theme changes. Subclasses pass it on to their children."""
+
+    def _on_scheme_changed(self, scheme: Qt.ColorScheme) -> None:
+        # With live glass, the background decides the theme instead.
+        if not self._live:
+            self.set_theme(theme_for_system())
+
+    # --- dragging -------------------------------------------------------
+
+    # A press on a child widget that doesn't handle the mouse itself (like a
+    # PeerRow) is passed up to us, so the whole window works as a handle.
+
+    def mousePressEvent(self, event) -> None:
+        if self.MOVABLE and event.button() == Qt.MouseButton.LeftButton:
+            self._press_global = event.globalPosition().toPoint()
+            self._press_pos = self.pos()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._press_global is None:
+            super().mouseMoveEvent(event)
+            return
+        cursor = event.globalPosition().toPoint()
+        delta = cursor - self._press_global
+        if not self._dragging:
+            # A tiny wobble during a click shouldn't move the window.
+            if delta.manhattanLength() < QGuiApplication.styleHints().startDragDistance():
+                return
+            self._start_drag()
+        # Keep it fully on the screen the cursor is on.
+        screen = QGuiApplication.screenAt(cursor) or self.screen()
+        self.move(self.clamped(self._press_pos + delta, screen.availableGeometry()))
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._press_global is not None and event.button() == Qt.MouseButton.LeftButton:
+            self._press_global = None
+            if self._dragging:
+                self._end_drag()
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def _start_drag(self) -> None:
+        self._dragging = True
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        self._take_snapshot()
+
+    def _end_drag(self) -> None:
+        self._dragging = False
+        self.unsetCursor()
+        self._snapshot = None
+        self.refresh_backdrop()  # one fresh grab now that it has stopped
+        self.on_drag_finished()
+
+    def on_drag_finished(self) -> None:
+        """Called after the user drops the window somewhere. Subclasses can react."""
+
+    # --- events ---------------------------------------------------------
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._live:
+            if not self.sliding:
+                self.refresh_backdrop()
+            self._capture_timer.start()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        self._capture_timer.stop()
+
+    def moveEvent(self, event) -> None:
+        super().moveEvent(event)
+        if self.sliding:
+            self._apply_clip()
+            return
+        if self._dragging:
+            self._backdrop_from_snapshot()
+        else:
+            self.refresh_backdrop()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        old = event.oldSize()
+        if self.isVisible() and not self.sliding and old.isValid():
+            # Grow or shrink around the middle (e.g. when peers join or
+            # leave), and stay on screen.
+            shift = QPoint((old.width() - self.width()) // 2, (old.height() - self.height()) // 2)
+            self.move(self.clamped(self.pos() + shift))
+            self.refresh_backdrop()
+
+    def _on_capture_timer(self) -> None:
+        if not self.sliding and not self._dragging:
+            self.refresh_backdrop()
+
+    # --- capture --------------------------------------------------------
+
+    def refresh_backdrop(self, at: QPoint | None = None) -> None:
+        """Capture and blur what's behind the window, at its current position
+        or at `at` if given (SideDock uses that before sliding a window in)."""
+        if not self._live:
+            return
+        screen = self.screen()
+        dpr = self.devicePixelRatioF()
+        pos = (self.pos() if at is None else at) - screen.geometry().topLeft()
+
+        # We're left out of screen captures, so this grabs exactly what's
+        # behind us. It grabs more than we cover: REFRACTION px of the
+        # surroundings to bend in at the edges, plus BLUR_PAD px so the blur
+        # samples real pixels near the edges instead of fading to transparent.
+        margin = REFRACTION + BLUR_PAD
+        shot = screen.grabWindow(
+            0, pos.x() - margin, pos.y() - margin,
+            self.width() + 2 * margin, self.height() + 2 * margin,
+        ).toImage()
+        shot.setDevicePixelRatio(1)  # work in physical pixels from here on
+
+        # Blur at half size: a quarter of the pixels, and it gets smoothly
+        # scaled back up anyway.
+        half = shot.scaled(
+            shot.width() // 2, shot.height() // 2,
+            Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation,
+        )
+        blurred = blur(half, BLUR_RADIUS)
+
+        # Cut off the padding, keeping the refraction margin.
+        pad = round(BLUR_PAD * dpr / 2)
+        self._set_backdrop(blurred.copy(pad, pad, blurred.width() - 2 * pad, blurred.height() - 2 * pad))
+
+    def _take_snapshot(self) -> None:
+        if not self._live:
+            return
+        screen = self.screen()
+        shot = screen.grabWindow(0).toImage()  # the whole screen, minus us
+        shot.setDevicePixelRatio(1)
+        half = shot.scaled(
+            shot.width() // 2, shot.height() // 2,
+            Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation,
+        )
+        self._snapshot = blur(half, BLUR_RADIUS)
+        self._snapshot_screen = screen.name()
+
+    def _backdrop_from_snapshot(self) -> None:
+        if self._snapshot is None:
+            return
+        if self.screen().name() != self._snapshot_screen:
+            self._take_snapshot()  # dragged onto another monitor
+        dpr = self.devicePixelRatioF()
+        pos = self.pos() - self.screen().geometry().topLeft()
+        scale = dpr / 2  # the snapshot is at half size
+        piece = QRect(
+            round((pos.x() - REFRACTION) * scale),
+            round((pos.y() - REFRACTION) * scale),
+            round((self.width() + 2 * REFRACTION) * scale),
+            round((self.height() + 2 * REFRACTION) * scale),
+        )
+        # Right at the screen edge the piece would stick out of the
+        # snapshot, so trim it to what's there.
+        self._set_backdrop(self._snapshot.copy(piece.intersected(self._snapshot.rect())))
+
+    def _set_backdrop(self, blurred: QImage) -> None:
+        """Turn a blurred view of what's behind us (REFRACTION px bigger than
+        us on every side) into the background we paint, and repaint."""
+        dpr = self.devicePixelRatioF()
+        w, h = round(self.width() * dpr), round(self.height() * dpr)
+        backdrop = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+        backdrop.fill(Qt.GlobalColor.transparent)
+        p = QPainter(backdrop)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        # Squeeze the view into our size. Everything shifts slightly towards
+        # the middle, so near the edges you see a bit of what's just outside,
+        # like light bending through thick glass.
+        p.drawImage(QRectF(0, 0, w, h), blurred)
+        # Cut it to the glass shape. DestinationIn keeps what's already there
+        # only where we now paint, and antialiasing keeps the curves smooth.
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0))
+        p.scale(dpr, dpr)  # so glass_shape() can work in normal (logical) pixels
+        p.drawPath(self.glass_shape(QRectF(0, 0, self.width(), self.height())))
+        p.end()
+
+        backdrop.setDevicePixelRatio(dpr)
+        self._backdrop = backdrop
+        self._adapt_to_background(blurred)
+        self.update()
+
+    def _adapt_to_background(self, image: QImage) -> None:
+        average = image.scaled(
+            1, 1, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation
+        ).pixelColor(0, 0)
+        brightness = luminance(average)
+        # Two thresholds, so a mid-grey background doesn't make it flicker
+        # between themes.
+        if self.theme is ON_DARK and brightness > 0.62:
+            self.set_theme(ON_LIGHT)
+        elif self.theme is ON_LIGHT and brightness < 0.48:
+            self.set_theme(ON_DARK)
+
+    # --- painting -------------------------------------------------------
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        t = self.theme
+        # Half-pixel inset so the 1 px rim lands exactly on whole pixels.
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        shape = self.glass_shape(rect)
+
+        # 0. the view of what's behind us, already blurred and cut to shape
+        if self._backdrop is not None:
+            p.drawImage(QPointF(0, 0), self._backdrop)
+            tint = t.tint
+        else:
+            tint = t.tint_opaque
+
+        # 1. a light tint over it
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(tint)
+        p.drawPath(shape)
+
+        # 2. sheen: light falling on the top half of the glass
+        sheen_end = QColor(t.sheen)
+        sheen_end.setAlpha(0)
+        sheen = QLinearGradient(rect.topLeft(), QPointF(rect.left(), rect.top() + rect.height() * 0.5))
+        sheen.setColorAt(0, t.sheen)
+        sheen.setColorAt(1, sheen_end)
+        p.setBrush(sheen)
+        p.drawPath(shape)
+
+        # 3. rim: a faint top edge fading away towards the bottom
+        rim = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+        rim.setColorAt(0, t.rim_top)
+        rim.setColorAt(1, t.rim_bottom)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QBrush(rim), 1))
+        p.drawPath(shape)
