@@ -14,8 +14,10 @@ class Theme:
     tint: QColor  # laid over the captured background
     tint_opaque: QColor  # used when we can't see behind the window
     sheen: QColor  # soft highlight across the top of the glass
-    rim_top: QColor  # faint edge at the top...
-    rim_bottom: QColor  # ...fading to this at the bottom
+    rim_light: QColor  # the thin edge where the light catches it, top left
+    rim_dim: QColor  # the edge in between
+    rim_far: QColor  # the fainter second highlight, bottom right
+    glow: QColor  # soft glow just inside the edge, at its brightest
     text: QColor
     hover: QColor
 
@@ -25,8 +27,10 @@ ON_DARK = Theme(
     tint=QColor(255, 255, 255, 24),
     tint_opaque=QColor(30, 32, 36, 235),
     sheen=QColor(255, 255, 255, 30),
-    rim_top=QColor(255, 255, 255, 70),
-    rim_bottom=QColor(255, 255, 255, 12),
+    rim_light=QColor(255, 255, 255, 95),
+    rim_dim=QColor(255, 255, 255, 10),
+    rim_far=QColor(255, 255, 255, 45),
+    glow=QColor(255, 255, 255, 20),
     text=QColor(255, 255, 255),
     hover=QColor(255, 255, 255, 36),
 )
@@ -36,8 +40,10 @@ ON_LIGHT = Theme(
     tint=QColor(255, 255, 255, 80),
     tint_opaque=QColor(246, 246, 248, 235),
     sheen=QColor(255, 255, 255, 90),
-    rim_top=QColor(255, 255, 255, 160),
-    rim_bottom=QColor(0, 0, 0, 14),
+    rim_light=QColor(255, 255, 255, 190),
+    rim_dim=QColor(0, 0, 0, 12),
+    rim_far=QColor(255, 255, 255, 120),
+    glow=QColor(255, 255, 255, 70),
     text=QColor(18, 20, 24),
     hover=QColor(255, 255, 255, 110),
 )

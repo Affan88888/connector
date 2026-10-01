@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "numpy>=2.5.3",
     "pyside6-essentials>=6.11.2",
     "qasync>=0.28.0",
     "zeroconf>=0.151.5",

@@ -1,6 +1,8 @@
 """The peer panel: one row per nearby laptop, plus the arrow that hides it."""
 
-from PySide6.QtCore import QRectF, QSize, Qt, Signal
+from functools import partial
+
+from PySide6.QtCore import QEasingCurve, QRectF, QSize, Qt, QVariantAnimation, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QLinearGradient, QPainter
 from PySide6.QtWidgets import QBoxLayout, QHBoxLayout, QLayout, QVBoxLayout, QWidget
 
@@ -8,6 +10,13 @@ from connector.ui.glass import Edge, GlassWindow
 from connector.ui.style import HoverFade, Theme, draw_chevron, ui_font
 
 AVATAR_COLORS = ["#5E8BFF", "#34C3A0", "#FF8A5C", "#B884FF", "#FF6FA8", "#F2B84B"]
+
+# The hover highlight glides between rows. The edge in front moves quickly
+# and the one behind follows more slowly, so it stretches as it moves and
+# then settles, like a drop of liquid.
+PILL_LEAD_MS = 150
+PILL_TRAIL_MS = 300
+PILL_RADIUS = 10
 
 
 def avatar_color(name: str) -> QColor:
@@ -17,7 +26,13 @@ def avatar_color(name: str) -> QColor:
 
 
 class PeerRow(QWidget):
-    """One peer: avatar and name. In milestone D this becomes the drop target."""
+    """One peer: avatar and name. In milestone D this becomes the drop target.
+
+    The hover highlight isn't drawn here but by the panel, so it can glide
+    from row to row.
+    """
+
+    hovered = Signal()
 
     HEIGHT = 40
     AVATAR = 26
@@ -31,7 +46,6 @@ class PeerRow(QWidget):
         super().__init__()
         self.display_name = display_name
         self._theme = theme
-        self._hover = HoverFade(self)
 
     def sizeHint(self) -> QSize:
         # Exactly wide enough for the avatar and this name, so the panel
@@ -45,21 +59,12 @@ class PeerRow(QWidget):
         self.update()
 
     def enterEvent(self, event) -> None:
-        self._hover.enter()
-
-    def leaveEvent(self, event) -> None:
-        self._hover.leave()
+        self.hovered.emit()
 
     def paintEvent(self, event) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setPen(Qt.PenStyle.NoPen)
-
-        if self._hover.value > 0:
-            hover = QColor(self._theme.hover)
-            hover.setAlphaF(hover.alphaF() * self._hover.value)
-            p.setBrush(hover)
-            p.drawRoundedRect(QRectF(self.rect()), 10, 10)
 
         size = self.AVATAR
         avatar = QRectF(self.PAD_LEFT, (self.height() - size) / 2, size, size)
@@ -89,6 +94,7 @@ class CollapseHandle(QWidget):
     Clicking it hides the panel off that edge."""
 
     clicked = Signal()
+    hovered = Signal()
     WIDTH = 16
 
     def __init__(self, theme: Theme) -> None:
@@ -110,6 +116,7 @@ class CollapseHandle(QWidget):
 
     def enterEvent(self, event) -> None:
         self._hover.enter()
+        self.hovered.emit()
 
     def leaveEvent(self, event) -> None:
         self._hover.leave()
@@ -162,15 +169,31 @@ class PeerWidget(GlassWindow):
         rows.setSpacing(2)
         self._layout.addLayout(rows)
 
+        # The hover highlight: where it is now, how visible it is, and one
+        # animation each for its top and bottom edge.
+        self._pill = QRectF()
+        self._pill_fade = HoverFade(self, 160)
+        self._pill_edges: dict[str, QVariantAnimation] = {}
+        for edge in ("top", "bottom"):
+            animation = QVariantAnimation(self)
+            animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+            animation.valueChanged.connect(partial(self._on_pill_edge, edge))
+            self._pill_edges[edge] = animation
+
         self._rows: list[PeerRow] = []
         for name in ["Bob", "Sara", "Omar"]:  # fake peers until milestone C
             row = PeerRow(name, self.theme)
+            # partial() fixes `row` now; a lambda here would see only the
+            # last row once the loop has finished.
+            row.hovered.connect(partial(self._glide_to, row))
             self._rows.append(row)
             rows.addWidget(row)
 
         self._handle = CollapseHandle(self.theme)
         # Passing the handle's click straight on as our own signal.
         self._handle.clicked.connect(self.collapse_requested)
+        # The arrow has its own highlight, so the glass one steps aside.
+        self._handle.hovered.connect(self._pill_fade.leave)
         self._layout.addWidget(self._handle)
 
     def on_theme_changed(self) -> None:
@@ -191,3 +214,54 @@ class PeerWidget(GlassWindow):
             QBoxLayout.Direction.RightToLeft if edge == "left" else QBoxLayout.Direction.LeftToRight
         )
         self._handle.set_pointing_right(edge == "right")
+
+    # --- the gliding hover highlight --------------------------------------
+
+    def _glide_to(self, row: PeerRow) -> None:
+        target = QRectF(row.geometry())
+        if self._pill_fade.value == 0:
+            # Not showing yet: appear right on this row, no gliding.
+            for animation in self._pill_edges.values():
+                animation.stop()
+            self._pill = target
+        else:
+            self._pill.setLeft(target.left())
+            self._pill.setRight(target.right())
+            moving_down = target.top() > self._pill.top()
+            self._animate_pill_edge("top", target.top(), PILL_TRAIL_MS if moving_down else PILL_LEAD_MS)
+            self._animate_pill_edge("bottom", target.bottom(), PILL_LEAD_MS if moving_down else PILL_TRAIL_MS)
+        self._pill_fade.enter()
+
+    def _animate_pill_edge(self, edge: str, end: float, duration_ms: int) -> None:
+        animation = self._pill_edges[edge]
+        animation.stop()
+        animation.setStartValue(self._pill.top() if edge == "top" else self._pill.bottom())
+        animation.setEndValue(end)
+        animation.setDuration(duration_ms)
+        animation.start()
+
+    def _on_pill_edge(self, edge: str, value: float) -> None:
+        if edge == "top":
+            self._pill.setTop(value)
+        else:
+            self._pill.setBottom(value)
+        self.update()
+
+    def leaveEvent(self, event) -> None:
+        self._pill_fade.leave()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        self._pill_fade.reset()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)  # the glass
+        if self._pill_fade.value == 0:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        hover = QColor(self.theme.hover)
+        hover.setAlphaF(hover.alphaF() * self._pill_fade.value)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(hover)
+        p.drawRoundedRect(self._pill, PILL_RADIUS, PILL_RADIUS)

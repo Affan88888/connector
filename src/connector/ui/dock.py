@@ -4,11 +4,19 @@ and back, leaving a small arrow tab at that edge while it's hidden."""
 from collections.abc import Callable
 
 from PySide6.QtCore import QEasingCurve, QObject, QPoint, QPropertyAnimation, QRect, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPainterPath
+from PySide6.QtGui import QColor, QGuiApplication, QPainter
 
 from connector.ui.glass import Edge, GlassWindow
 from connector.ui.style import HoverFade, draw_chevron
 from connector.ui.widget import PeerWidget
+
+
+def springy(kind: QEasingCurve.Type, overshoot: float) -> QEasingCurve:
+    """An easing curve that goes past its end (OutBack) or pulls back before
+    starting (InBack) by `overshoot`: 0 is none, Qt's default is about 1.7."""
+    curve = QEasingCurve(kind)
+    curve.setOvershoot(overshoot)
+    return curve
 
 
 class EdgeTab(GlassWindow):
@@ -31,17 +39,13 @@ class EdgeTab(GlassWindow):
         self._edge = edge
         self.update()
 
-    def glass_shape(self, rect: QRectF) -> QPainterPath:
+    def glass_geometry(self, rect: QRectF) -> tuple[QRectF, float]:
         # Round only the two corners facing into the screen. The rectangle
         # runs past the window on the edge side, so the corners there fall
         # outside the window and get cut off.
         if self._edge == "right":
-            rect = rect.adjusted(0, 0, self.CORNER, 0)
-        else:
-            rect = rect.adjusted(-self.CORNER, 0, 0, 0)
-        path = QPainterPath()
-        path.addRoundedRect(rect, self.CORNER, self.CORNER)
-        return path
+            return rect.adjusted(0, 0, self.CORNER, 0), self.CORNER
+        return rect.adjusted(-self.CORNER, 0, 0, 0), self.CORNER
 
     def enterEvent(self, event) -> None:
         self._hover.enter()
@@ -110,7 +114,9 @@ class SideDock(QObject):
         self._edge = self.panel.nearest_edge()
         self._area = self.panel.screen().availableGeometry()
         end = self._past_edge(self.panel, self._home.y())
-        self._slide(self.panel, end, QEasingCurve.Type.InCubic, 220, self._after_collapse)
+        # InBack: a small pull back first, like a drop gathering itself
+        # before it moves, then away.
+        self._slide(self.panel, end, springy(QEasingCurve.Type.InBack, 0.9), 260, self._after_collapse)
 
     def _after_collapse(self) -> None:
         self.panel.hide()
@@ -122,18 +128,18 @@ class SideDock(QObject):
         else:
             x = self._area.x()
         target = self.tab.clamped(QPoint(x, middle_y - self.tab.height() // 2), self._area)
-        self._slide_in(self.tab, target, 180)
+        self._slide_in(self.tab, target, 260)
 
     def expand(self) -> None:
         if self._animation is not None:
             return
         end = self._past_edge(self.tab, self.tab.y())
-        self._slide(self.tab, end, QEasingCurve.Type.InCubic, 150, self._after_expand)
+        self._slide(self.tab, end, springy(QEasingCurve.Type.InBack, 0.9), 180, self._after_expand)
 
     def _after_expand(self) -> None:
         self.tab.hide()
         self.panel.adjustSize()  # it may have grown or shrunk while hidden
-        self._slide_in(self.panel, self.panel.clamped(self._home, self._area), 240)
+        self._slide_in(self.panel, self.panel.clamped(self._home, self._area), 340)
 
     def _past_edge(self, window: GlassWindow, y: int) -> QPoint:
         """Just past the screen edge we're hiding at, at height y."""
@@ -147,13 +153,15 @@ class SideDock(QObject):
         window.refresh_backdrop(at=target)
         window.move(self._past_edge(window, target.y()))
         window.show()
-        self._slide(window, target, QEasingCurve.Type.OutCubic, duration_ms, None)
+        # OutBack: it shoots slightly past where it's going and settles back,
+        # like liquid sloshing to a stop.
+        self._slide(window, target, springy(QEasingCurve.Type.OutBack, 1.1), duration_ms, None)
 
     def _slide(
         self,
         window: GlassWindow,
         end: QPoint,
-        curve: QEasingCurve.Type,
+        curve: QEasingCurve,
         duration_ms: int,
         then: Callable[[], None] | None,
     ) -> None:

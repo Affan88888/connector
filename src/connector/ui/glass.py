@@ -28,12 +28,13 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QGraphicsBlurEffect, QGraphicsPixmapItem, QGraphicsScene, QWidget
 
+from connector.ui.optics import STRENGTH, extend_edges, refract
 from connector.ui.style import ON_DARK, ON_LIGHT, RADIUS, Theme, luminance, theme_for_system
 
 Edge = Literal["left", "right"]
 
 CAPTURE_INTERVAL_MS = 125  # refresh the view of what's behind, 8 times a second
-REFRACTION = 8  # px of the surroundings bent in at the edges
+REFRACTION = STRENGTH + 4  # px of the surroundings grabbed for the edges to bend in
 BLUR_RADIUS = 6  # blur strength, applied at half size
 BLUR_PAD = 12  # extra px grabbed so the blur has real pixels to sample at the edges
 
@@ -195,10 +196,16 @@ class GlassWindow(QWidget):
 
     # --- shape and theme ------------------------------------------------
 
+    def glass_geometry(self, rect: QRectF) -> tuple[QRectF, float]:
+        """The glass's rounded rectangle and corner radius, for a window of
+        size `rect`. Subclasses can override it to change the shape."""
+        return rect, RADIUS
+
     def glass_shape(self, rect: QRectF) -> QPainterPath:
-        """The outline of the glass. Subclasses can override it."""
+        """The outline of the glass, as a path to paint with."""
+        box, radius = self.glass_geometry(rect)
         path = QPainterPath()
-        path.addRoundedRect(rect, RADIUS, RADIUS)
+        path.addRoundedRect(box, radius, radius)
         return path
 
     def set_theme(self, theme: Theme) -> None:
@@ -321,11 +328,22 @@ class GlassWindow(QWidget):
         # surroundings to bend in at the edges, plus BLUR_PAD px so the blur
         # samples real pixels near the edges instead of fading to transparent.
         margin = REFRACTION + BLUR_PAD
+        area = QRect(pos.x() - margin, pos.y() - margin, self.width() + 2 * margin, self.height() + 2 * margin)
+        # Only grab what's on the screen, and repeat its edge pixels for any
+        # part past the screen edge, where a grab would give black.
+        on_screen = area.intersected(QRect(QPoint(0, 0), screen.geometry().size()))
         shot = screen.grabWindow(
-            0, pos.x() - margin, pos.y() - margin,
-            self.width() + 2 * margin, self.height() + 2 * margin,
+            0, on_screen.x(), on_screen.y(), on_screen.width(), on_screen.height()
         ).toImage()
         shot.setDevicePixelRatio(1)  # work in physical pixels from here on
+        if on_screen != area:
+            shot = extend_edges(
+                shot,
+                round((on_screen.left() - area.left()) * dpr),
+                round((on_screen.top() - area.top()) * dpr),
+                round((area.right() - on_screen.right()) * dpr),
+                round((area.bottom() - on_screen.bottom()) * dpr),
+            )
 
         # Blur at half size: a quarter of the pixels, and it gets smoothly
         # scaled back up anyway.
@@ -366,31 +384,63 @@ class GlassWindow(QWidget):
             round((self.width() + 2 * REFRACTION) * scale),
             round((self.height() + 2 * REFRACTION) * scale),
         )
-        # Right at the screen edge the piece would stick out of the
-        # snapshot, so trim it to what's there.
-        self._set_backdrop(self._snapshot.copy(piece.intersected(self._snapshot.rect())))
+        # Right at the screen edge the piece sticks out of the snapshot:
+        # take what's there and repeat its edge pixels for the rest.
+        inside = piece.intersected(self._snapshot.rect())
+        view = self._snapshot.copy(inside)
+        if inside != piece:
+            view = extend_edges(
+                view,
+                inside.left() - piece.left(),
+                inside.top() - piece.top(),
+                piece.right() - inside.right(),
+                piece.bottom() - inside.bottom(),
+            )
+        self._set_backdrop(view)
 
     def _set_backdrop(self, blurred: QImage) -> None:
-        """Turn a blurred view of what's behind us (REFRACTION px bigger than
-        us on every side) into the background we paint, and repaint."""
+        """Turn a blurred, half-size view of what's behind us (REFRACTION px
+        bigger than us on every side) into the background we paint."""
         dpr = self.devicePixelRatioF()
+        scale = dpr / 2  # the blurred view is at half size
+
+        # Bend the view near the edges (see optics.py). Done at half size,
+        # where there are four times fewer pixels to work out.
+        rect, radius = self.glass_geometry(QRectF(0, 0, self.width(), self.height()))
+        box = (
+            rect.x() * scale,
+            rect.y() * scale,
+            (rect.x() + rect.width()) * scale,
+            (rect.y() + rect.height()) * scale,
+        )
+        view = refract(
+            blurred,
+            max(1, round(self.width() * scale)),
+            max(1, round(self.height() * scale)),
+            REFRACTION * scale,
+            box,
+            radius * scale,
+            scale,
+        )
+
         w, h = round(self.width() * dpr), round(self.height() * dpr)
         backdrop = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
         backdrop.fill(Qt.GlobalColor.transparent)
         p = QPainter(backdrop)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        # Squeeze the view into our size. Everything shifts slightly towards
-        # the middle, so near the edges you see a bit of what's just outside,
-        # like light bending through thick glass.
-        p.drawImage(QRectF(0, 0, w, h), blurred)
-        # Cut it to the glass shape. DestinationIn keeps what's already there
-        # only where we now paint, and antialiasing keeps the curves smooth.
-        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+        # First the glass shape, solid, with antialiased (smooth) curves.
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(0, 0, 0))
+        p.save()
         p.scale(dpr, dpr)  # so glass_shape() can work in normal (logical) pixels
         p.drawPath(self.glass_shape(QRectF(0, 0, self.width(), self.height())))
+        p.restore()
+        # Then the view, scaled up to full size. SourceIn keeps it only where
+        # the shape is, so the corners outside it stay see-through. The
+        # smooth scaling also softens the steps between the bent pixels.
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+        p.drawImage(QRectF(0, 0, w, h), view)
         p.end()
 
         backdrop.setDevicePixelRatio(dpr)
@@ -441,10 +491,24 @@ class GlassWindow(QWidget):
         p.setBrush(sheen)
         p.drawPath(shape)
 
-        # 3. rim: a faint top edge fading away towards the bottom
-        rim = QLinearGradient(rect.topLeft(), rect.bottomLeft())
-        rim.setColorAt(0, t.rim_top)
-        rim.setColorAt(1, t.rim_bottom)
+        # 3. a soft glow just inside the edge, which makes the glass look
+        # thick: brightest where the light hits, top left, and again
+        # bottom right, fading out in between.
+        glow = QLinearGradient(rect.topLeft(), rect.bottomRight())
+        glow_none = QColor(t.glow)
+        glow_none.setAlpha(0)
+        glow.setColorAt(0, t.glow)
+        glow.setColorAt(0.5, glow_none)
+        glow.setColorAt(1, t.glow)
         p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QBrush(glow), 3))
+        p.drawPath(self.glass_shape(rect.adjusted(1.5, 1.5, -1.5, -1.5)))
+
+        # 4. rim: a thin bright edge where the light catches it, top left,
+        # and a fainter one bottom right, like the two highlights on a lens
+        rim = QLinearGradient(rect.topLeft(), rect.bottomRight())
+        rim.setColorAt(0, t.rim_light)
+        rim.setColorAt(0.5, t.rim_dim)
+        rim.setColorAt(1, t.rim_far)
         p.setPen(QPen(QBrush(rim), 1))
         p.drawPath(shape)
