@@ -1,9 +1,10 @@
 """Colours, fonts and small drawing helpers shared by the widget's windows."""
 
+import math
 from dataclasses import dataclass
 
 from PySide6.QtCore import QAbstractAnimation, QPointF, Qt, QVariantAnimation
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen, QPolygonF
+from PySide6.QtGui import QColor, QFont, QFontMetricsF, QGuiApplication, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
 RADIUS = 16  # corner radius of the glass
@@ -60,6 +61,17 @@ def ui_font(pixel_size: int, weight: QFont.Weight = QFont.Weight.Normal) -> QFon
     font.setPixelSize(pixel_size)
     font.setWeight(weight)
     return font
+
+
+def text_width(text: str, font: QFont, widget: QWidget) -> int:
+    """Whole pixels needed to draw `text` in `font` on `widget`, never cut off.
+
+    Measured for the widget itself, because text can come out a few pixels
+    narrower or wider depending on the screen's scaling, and the painter
+    measures it the same way. Rounded up, plus 1 px of slack, since the
+    painter cuts a name off ("car…") if it's even a fraction too wide.
+    """
+    return math.ceil(QFontMetricsF(font, widget).horizontalAdvance(text)) + 1
 
 
 def luminance(color: QColor) -> float:
