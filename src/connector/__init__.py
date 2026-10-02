@@ -7,19 +7,23 @@ import qasync
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
-from connector.net.discovery import Discovery
-from connector.ui.dock import SideDock
+from connector.app import App
 
 
 def main() -> None:
     args = parse_args()
+    # Page titles can contain any character. When the output goes somewhere
+    # other than a real console (a file, a pipe), printing one Windows can't
+    # encode would crash the app; this prints a ? in its place instead.
+    if sys.stdout is not None:
+        sys.stdout.reconfigure(errors="replace")
 
     # One QApplication per program, before any window.
-    app = QApplication(sys.argv)
+    qt_app = QApplication(sys.argv)
     # The app lives at the edge of the screen. Hiding its windows (like the
     # panel while it's tucked away) must never make Qt end the app.
-    app.setQuitOnLastWindowClosed(False)
-    _let_python_notice_ctrl_c(app)
+    qt_app.setQuitOnLastWindowClosed(False)
+    _let_python_notice_ctrl_c(qt_app)
 
     try:
         # Like asyncio.run(), but the asyncio event loop it uses is Qt's event
@@ -50,40 +54,26 @@ def default_name() -> str:
 
 
 async def run(name: str) -> None:
-    """Everything the app does, from start to shutdown."""
-    dock = SideDock()
-    dock.show()
-
-    # Nothing listens for links yet, so we advertise port 0. Step 3 adds the
-    # server and passes its real port here.
-    discovery = Discovery(name, port=0)
-    discovery.peer_added.connect(dock.panel.add_peer)
-    discovery.peer_removed.connect(dock.panel.remove_peer)
-    # Also report it in the terminal, which helps while testing.
-    discovery.peer_added.connect(lambda peer: print(f"+ {peer.name} ({peer.address})"))
-    discovery.peer_removed.connect(lambda peer: print(f"- {peer.name} left"))
-
+    """The app's whole life: start everything, wait, stop everything."""
+    app = App(name)
     # Run until told to stop. For now that's only Ctrl+C: asyncio then cancels
     # this coroutine, and the `finally` below still runs. A Quit menu item
     # later will set this event instead.
     quit_requested = asyncio.Event()
     try:
-        await discovery.start()
-        print(f"Connector is running as {name!r}. Press Ctrl+C to quit.")
+        await app.start()
         await quit_requested.wait()
     finally:
         print("Shutting down...")
-        # Sends the mDNS goodbye, so other laptops drop us straight away
-        # instead of listing us for another hour.
-        await discovery.stop()
+        await app.stop()
         print("Bye.")
 
 
-def _let_python_notice_ctrl_c(app: QApplication) -> None:
+def _let_python_notice_ctrl_c(qt_app: QApplication) -> None:
     # Python handles Ctrl+C between Python instructions only. While the app is
     # idle, the thread waits inside Qt's C++ code and Python never gets a
     # turn, so Ctrl+C would sit unnoticed. This timer runs a tiny bit of
     # Python five times a second, which gives it that turn.
-    timer = QTimer(app)  # parented to app, so it lives as long as the app
+    timer = QTimer(qt_app)  # parented to the app, so it lives as long as the app
     timer.timeout.connect(lambda: None)
     timer.start(200)

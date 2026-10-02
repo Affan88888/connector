@@ -3,11 +3,14 @@ and back, leaving a small arrow tab at that edge while it's hidden."""
 
 from collections.abc import Callable
 
-from PySide6.QtCore import QEasingCurve, QObject, QPoint, QPropertyAnimation, QRect, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QEasingCurve, QObject, QPoint, QPropertyAnimation, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QGuiApplication, QPainter
 
+from connector.core.links import Link
 from connector.ui.glass import Edge, GlassWindow
+from connector.ui.links import link_from_drag
 from connector.ui.style import HoverFade, draw_chevron
+from connector.ui.toast import Toast
 from connector.ui.widget import PeerWidget
 
 
@@ -20,12 +23,19 @@ def springy(kind: QEasingCurve.Type, overshoot: float) -> QEasingCurve:
 
 
 class EdgeTab(GlassWindow):
-    """The small tab left at the screen edge while the panel is hidden."""
+    """The small tab left at the screen edge while the panel is hidden.
+
+    Click it to bring the panel back, or hold a dragged link over it for a
+    moment and it opens by itself, so you can drop the link on a name
+    without letting go first.
+    """
 
     clicked = Signal()
+    link_held = Signal()  # a dragged link has been held over the tab
     MOVABLE = False  # it belongs at the edge; clicking it is all it does
     SIZE = QSize(18, 48)
     CORNER = 12
+    HOLD_MS = 250  # long enough not to open when a drag merely passes by
 
     def __init__(self) -> None:
         super().__init__()
@@ -34,6 +44,12 @@ class EdgeTab(GlassWindow):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip("Show")
         self._hover = HoverFade(self)
+
+        self.setAcceptDrops(True)
+        self._hold = QTimer(self)
+        self._hold.setSingleShot(True)
+        self._hold.setInterval(self.HOLD_MS)
+        self._hold.timeout.connect(self.link_held)
 
     def set_edge(self, edge: Edge) -> None:
         self._edge = edge
@@ -57,6 +73,27 @@ class EdgeTab(GlassWindow):
         if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
             self._hover.reset()
             self.clicked.emit()
+
+    def dragEnterEvent(self, event) -> None:
+        if link_from_drag(event.mimeData()) is None:
+            event.ignore()
+            return
+        # Accepting is what makes Qt tell us when the drag leaves again.
+        event.acceptProposedAction()
+        self._hover.enter()
+        self._hold.start()
+
+    def dragLeaveEvent(self, event) -> None:
+        self._hold.stop()  # passed by without stopping: stay hidden
+        self._hover.leave()
+
+    def dropEvent(self, event) -> None:
+        # Let go on the tab itself: there's no one here to send it to, so
+        # just open the panel.
+        event.ignore()
+        self._hold.stop()
+        self._hover.reset()
+        self.link_held.emit()
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)  # the glass
@@ -85,8 +122,10 @@ class SideDock(QObject):
         super().__init__()
         self.panel = PeerWidget()
         self.tab = EdgeTab()
+        self.toast = Toast()
         self.panel.collapse_requested.connect(self.collapse)
         self.tab.clicked.connect(self.expand)
+        self.tab.link_held.connect(self.expand)
         self._animation: QPropertyAnimation | None = None
 
         # Remembered when the panel is hidden, to bring it back to the same place.
@@ -106,6 +145,11 @@ class SideDock(QObject):
             area.y() + (area.height() - self.panel.height()) // 2,
         )
         self.panel.show()
+
+    def show_toast(self, sender: str, link: Link) -> None:
+        """Say who sent a link, beside the panel (or the tab, if it's hidden)."""
+        beside = self.panel.geometry() if self.panel.isVisible() else self.tab.geometry()
+        self.toast.show_link(sender, link, beside)
 
     def collapse(self) -> None:
         if self._animation is not None:  # already moving

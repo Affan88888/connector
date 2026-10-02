@@ -21,6 +21,11 @@ class Theme:
     glow: QColor  # soft glow just inside the edge, at its brightest
     text: QColor
     hover: QColor
+    # Row highlights. Each is drawn as a soft fill plus a brighter edge, both
+    # made from this one colour (see PeerRow.paintEvent).
+    drop: QColor  # a link is being dragged over the row: "it lands here"
+    sent: QColor  # the link arrived
+    failed: QColor  # it didn't
 
 
 # Light text, for glass over something dark.
@@ -34,6 +39,9 @@ ON_DARK = Theme(
     glow=QColor(255, 255, 255, 20),
     text=QColor(255, 255, 255),
     hover=QColor(255, 255, 255, 36),
+    drop=QColor(150, 185, 255),
+    sent=QColor(110, 230, 160),
+    failed=QColor(255, 120, 120),
 )
 
 # Dark text, for glass over something bright.
@@ -47,6 +55,9 @@ ON_LIGHT = Theme(
     glow=QColor(255, 255, 255, 70),
     text=QColor(18, 20, 24),
     hover=QColor(255, 255, 255, 110),
+    drop=QColor(60, 110, 255),
+    sent=QColor(30, 160, 80),
+    failed=QColor(220, 50, 50),
 )
 
 

@@ -3,11 +3,12 @@
 from functools import partial
 
 from PySide6.QtCore import QEasingCurve, QRectF, QSize, Qt, QVariantAnimation, Signal
-from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter
+from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPen
 from PySide6.QtWidgets import QBoxLayout, QHBoxLayout, QLayout, QVBoxLayout, QWidget
 
 from connector.core.peers import Peer
 from connector.ui.glass import Edge, GlassWindow
+from connector.ui.links import link_from_drag
 from connector.ui.style import HoverFade, Theme, draw_chevron, text_width, ui_font
 
 AVATAR_COLORS = ["#5E8BFF", "#34C3A0", "#FF8A5C", "#B884FF", "#FF6FA8", "#F2B84B"]
@@ -27,13 +28,14 @@ def avatar_color(name: str) -> QColor:
 
 
 class PeerRow(QWidget):
-    """One peer: avatar and name. In milestone D this becomes the drop target.
+    """One peer: avatar and name. Drop a web link on it to send it to them.
 
     The hover highlight isn't drawn here but by the panel, so it can glide
-    from row to row.
+    from row to row. The drop highlight is drawn here.
     """
 
     hovered = Signal()
+    link_dropped = Signal(object)  # a Link
 
     HEIGHT = 40
     AVATAR = 26
@@ -47,6 +49,24 @@ class PeerRow(QWidget):
         super().__init__()
         self.peer = peer
         self._theme = theme
+
+        # Without this, Qt never offers the row anything being dragged.
+        self.setAcceptDrops(True)
+        # Fades the "it lands here" highlight in and out during a drag.
+        self._drop = HoverFade(self, 120)
+        # A flash that fades from 1 to 0: blue when a link is dropped, then
+        # green or red once we know whether it arrived.
+        self._flash = 0.0
+        self._flash_kind = "drop"  # "drop", "sent" or "failed"
+        self._flash_anim = QVariantAnimation(self)
+        self._flash_anim.setStartValue(1.0)
+        self._flash_anim.setEndValue(0.0)
+        self._flash_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._flash_anim.valueChanged.connect(self._on_flash)
+        # True from the drop until we know whether it arrived, which can take
+        # a few seconds if the other laptop doesn't answer. Meanwhile the row
+        # keeps a soft blue glow, so it's clear something is still happening.
+        self._sending = False
 
     def sizeHint(self) -> QSize:
         # Exactly wide enough for the avatar and this name, so the panel
@@ -66,11 +86,80 @@ class PeerRow(QWidget):
     def enterEvent(self, event) -> None:
         self.hovered.emit()
 
+    # --- drag and drop ----------------------------------------------------
+
+    def dragEnterEvent(self, event) -> None:
+        if link_from_drag(event.mimeData()) is None:
+            # Not a web link: ignoring it makes the cursor show "can't drop".
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self._drop.enter()
+
+    def dragMoveEvent(self, event) -> None:
+        # Keep accepting while it moves around inside the row. (Qt only
+        # sends this once dragEnterEvent has accepted.)
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event) -> None:
+        self._drop.leave()
+
+    def dropEvent(self, event) -> None:
+        self._drop.reset()
+        link = link_from_drag(event.mimeData())
+        if link is None:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self._sending = True
+        self._start_flash("drop", 600)
+        self.link_dropped.emit(link)
+
+    def show_result(self, arrived: bool) -> None:
+        """Flash green if the link arrived, red if it didn't."""
+        self._sending = False
+        self._start_flash("sent" if arrived else "failed", 1200)
+
+    def _start_flash(self, kind: str, duration_ms: int) -> None:
+        self._flash_kind = kind
+        self._flash_anim.stop()
+        self._flash_anim.setDuration(duration_ms)
+        self._flash_anim.start()
+
+    def _on_flash(self, value: float) -> None:
+        self._flash = value
+        self.update()
+
+    # --- painting ---------------------------------------------------------
+
+    FILL_STRENGTH = 0.3  # how strongly a highlight's colour fills the row
+    RIM_STRENGTH = 0.8  # and its edge
+    SENDING_STRENGTH = 0.45  # the soft glow while waiting to hear back
+
     def paintEvent(self, event) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(Qt.PenStyle.NoPen)
 
+        # The highlight: blue while a link is held over the row, otherwise
+        # whichever flash is fading out. The drop flash fades down to the
+        # "sending" glow rather than to nothing while we wait for an answer.
+        if self._drop.value >= self._flash:
+            color, strength = self._theme.drop, self._drop.value
+        else:
+            kinds = {"drop": self._theme.drop, "sent": self._theme.sent, "failed": self._theme.failed}
+            color, strength = kinds[self._flash_kind], self._flash
+        if self._sending and strength < self.SENDING_STRENGTH:
+            color, strength = self._theme.drop, self.SENDING_STRENGTH
+        if strength > 0:
+            fill = QColor(color)
+            fill.setAlphaF(self.FILL_STRENGTH * strength)
+            rim = QColor(color)
+            rim.setAlphaF(self.RIM_STRENGTH * strength)
+            p.setBrush(fill)
+            p.setPen(QPen(rim, 1))
+            p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 10, 10)
+
+        p.setPen(Qt.PenStyle.NoPen)
         size = self.AVATAR
         avatar = QRectF(self.PAD_LEFT, (self.height() - size) / 2, size, size)
         base = avatar_color(self.peer.name)
@@ -211,6 +300,7 @@ class PeerWidget(GlassWindow):
     """The glass panel listing nearby peers."""
 
     collapse_requested = Signal()
+    send_requested = Signal(object, object)  # (Peer, Link): a link was dropped on a peer
 
     def __init__(self) -> None:
         super().__init__()
@@ -272,6 +362,7 @@ class PeerWidget(GlassWindow):
             # partial() fixes `row` now. A lambda would look `row` up only
             # when called, and by then it could be a different row.
             row.hovered.connect(partial(self._glide_to, row))
+            row.link_dropped.connect(partial(self._on_link_dropped, row))
             self._rows[peer.id] = row
         else:
             row.set_peer(peer)
@@ -286,6 +377,16 @@ class PeerWidget(GlassWindow):
         self._rows_layout.removeWidget(row)
         row.deleteLater()  # Qt deletes it once it's safe to, after this event
         self._rows_changed()
+
+    def show_send_result(self, peer: Peer, arrived: bool) -> None:
+        row = self._rows.get(peer.id)
+        if row is not None:  # they may have left while it was sending
+            row.show_result(arrived)
+
+    def _on_link_dropped(self, row: PeerRow, link) -> None:
+        # Read the peer from the row now, not when it was created: its
+        # details may have been updated since.
+        self.send_requested.emit(row.peer, link)
 
     def _position_for(self, peer: Peer) -> int:
         """Layout position that keeps rows in alphabetical order."""
