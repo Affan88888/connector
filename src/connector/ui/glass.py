@@ -13,7 +13,7 @@ import ctypes
 import sys
 from typing import Literal
 
-from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer
+from PySide6.QtCore import QPoint, QPointF, QPropertyAnimation, QRect, QRectF, Qt, QTimer
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -34,6 +34,7 @@ from connector.ui.style import ON_DARK, ON_LIGHT, RADIUS, Theme, luminance, them
 Edge = Literal["left", "right"]
 
 CAPTURE_INTERVAL_MS = 125  # refresh the view of what's behind, 8 times a second
+FADE_MS = 180  # fade_in() and fade_out()
 REFRACTION = STRENGTH + 4  # px of the surroundings grabbed for the edges to bend in
 BLUR_RADIUS = 6  # blur strength, applied at half size
 BLUR_PAD = 12  # extra px grabbed so the blur has real pixels to sample at the edges
@@ -141,6 +142,10 @@ class GlassWindow(QWidget):
         self._capture_timer.setInterval(CAPTURE_INTERVAL_MS)
         self._capture_timer.timeout.connect(self._on_capture_timer)
 
+        self._fade = QPropertyAnimation(self, b"windowOpacity", self)
+        self._fade.setDuration(FADE_MS)
+        self._fade.finished.connect(self._after_fade)
+
         QGuiApplication.styleHints().colorSchemeChanged.connect(self._on_scheme_changed)
 
         # winId() inside creates the native window now, so it's left out of
@@ -165,6 +170,41 @@ class GlassWindow(QWidget):
         """The side edge of the screen, left or right, closest to the window's middle."""
         area = self.screen().availableGeometry()
         return "left" if self.geometry().center().x() < area.center().x() else "right"
+
+    def place_beside(self, other: QRect, gap: int = 10) -> None:
+        """Move next to another window's rectangle, on the side facing the
+        middle of the screen (where there's room), level with its middle."""
+        screen = QGuiApplication.screenAt(other.center()) or QGuiApplication.primaryScreen()
+        area = screen.availableGeometry()
+        if other.center().x() > area.center().x():
+            x = other.x() - gap - self.width()
+        else:
+            x = other.x() + other.width() + gap
+        y = other.center().y() - self.height() // 2
+        self.move(self.clamped(QPoint(x, y), area))
+
+    def fade_in(self) -> None:
+        """Show the window, fading it in."""
+        if not self.isVisible():
+            self.setWindowOpacity(0.0)
+            self.show()
+        self._fade_to(1.0)
+
+    def fade_out(self) -> None:
+        """Fade the window out, then hide it."""
+        if self.isVisible():
+            self._fade_to(0.0)
+
+    def _fade_to(self, opacity: float) -> None:
+        # windowOpacity fades the whole window, glass and all.
+        self._fade.stop()
+        self._fade.setStartValue(self.windowOpacity())
+        self._fade.setEndValue(opacity)
+        self._fade.start()
+
+    def _after_fade(self) -> None:
+        if self.windowOpacity() < 0.01:
+            self.hide()
 
     def set_sliding(self, sliding: bool, clip: QRect | None = None) -> None:
         """Called by SideDock around its animations.
@@ -256,9 +296,16 @@ class GlassWindow(QWidget):
             self._press_global = None
             if self._dragging:
                 self._end_drag()
+            else:
+                # Pressed and released without moving: a click, not a drag.
+                self.on_clicked(self.mapFromGlobal(event.globalPosition().toPoint()))
             event.accept()
         else:
             super().mouseReleaseEvent(event)
+
+    def on_clicked(self, pos: QPoint) -> None:
+        """Called for a click that didn't become a drag, with its position
+        in this window. Subclasses can react."""
 
     def _start_drag(self) -> None:
         self._dragging = True

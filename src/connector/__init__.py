@@ -29,7 +29,7 @@ def main() -> None:
         # Like asyncio.run(), but the asyncio event loop it uses is Qt's event
         # loop underneath. One loop on one thread runs both the UI and the
         # async (network) code, taking turns.
-        qasync.run(run(args.name))
+        qasync.run(run(args.name, args.profile))
     except KeyboardInterrupt:
         # How asyncio reports Ctrl+C once run() has finished cleaning up.
         pass
@@ -42,6 +42,11 @@ def parse_args() -> argparse.Namespace:
         default=default_name(),
         help="the name other people see (default: your Windows user name)",
     )
+    parser.add_argument(
+        "--profile",
+        default="default",
+        help="keeps its own key and pairings, e.g. to test two copies on one laptop",
+    )
     # parse_known_args() leaves alone any options meant for Qt itself.
     args, _ = parser.parse_known_args()
     return args
@@ -53,9 +58,9 @@ def default_name() -> str:
     return user[:1].upper() + user[1:]
 
 
-async def run(name: str) -> None:
+async def run(name: str, profile: str) -> None:
     """The app's whole life: start everything, wait, stop everything."""
-    app = App(name)
+    app = App(name, profile)
     # Run until told to stop. For now that's only Ctrl+C: asyncio then cancels
     # this coroutine, and the `finally` below still runs. A Quit menu item
     # later will set this event instead.

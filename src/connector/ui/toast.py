@@ -2,8 +2,8 @@
 
 from urllib.parse import urlsplit
 
-from PySide6.QtCore import QPoint, QPropertyAnimation, QRect, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QLinearGradient, QPainter
+from PySide6.QtCore import QRect, QRectF, Qt, QTimer
+from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter
 
 from connector.core.links import Link
 from connector.ui.glass import GlassWindow
@@ -14,8 +14,6 @@ from connector.ui.widget import avatar_color
 class Toast(GlassWindow):
     MOVABLE = False
     SHOW_MS = 4500  # then it fades away by itself; clicking it closes it sooner
-    FADE_MS = 180
-    GAP = 10  # between the toast and the panel (or tab) it appears beside
     PAD = 10
     AVATAR = 28
     HEIGHT = 52
@@ -34,12 +32,7 @@ class Toast(GlassWindow):
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(self.SHOW_MS)
-        self._timer.timeout.connect(self.dismiss)
-
-        # windowOpacity fades the whole window, glass and all.
-        self._fade = QPropertyAnimation(self, b"windowOpacity", self)
-        self._fade.setDuration(self.FADE_MS)
-        self._fade.finished.connect(self._after_fade)
+        self._timer.timeout.connect(self.fade_out)
 
     def show_link(self, sender: str, link: Link, beside: QRect) -> None:
         """Show who sent what, next to `beside` (the panel, or the tab)."""
@@ -54,45 +47,18 @@ class Toast(GlassWindow):
         )
         width = self.PAD + self.AVATAR + self.PAD + min(text, self.MAX_TEXT_WIDTH) + self.PAD + 4
         self.setFixedSize(width, self.HEIGHT)
-        self.move(self._position_beside(beside))
+        self.place_beside(beside)
 
         # A second link while it's showing just replaces the text and
         # restarts the countdown.
         self._timer.start()
-        if not self.isVisible():
-            self.setWindowOpacity(0.0)
-            self.show()
-        self._fade_to(1.0)
+        self.fade_in()
         self.update()
-
-    def dismiss(self) -> None:
-        self._timer.stop()
-        self._fade_to(0.0)
-
-    def _fade_to(self, opacity: float) -> None:
-        self._fade.stop()
-        self._fade.setStartValue(self.windowOpacity())
-        self._fade.setEndValue(opacity)
-        self._fade.start()
-
-    def _after_fade(self) -> None:
-        if self.windowOpacity() < 0.01:
-            self.hide()
-
-    def _position_beside(self, beside: QRect) -> QPoint:
-        screen = QGuiApplication.screenAt(beside.center()) or QGuiApplication.primaryScreen()
-        area = screen.availableGeometry()
-        # On the side facing the middle of the screen, so it has room.
-        if beside.center().x() > area.center().x():
-            x = beside.x() - self.GAP - self.width()
-        else:
-            x = beside.x() + beside.width() + self.GAP
-        y = beside.center().y() - self.height() // 2
-        return self.clamped(QPoint(x, y), area)
 
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self.dismiss()
+            self._timer.stop()
+            self.fade_out()
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)  # the glass

@@ -15,10 +15,13 @@ from PySide6.QtCore import QObject, Signal
 from zeroconf import ServiceStateChange, Zeroconf
 from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZeroconf
 
+from connector.core.identity import is_valid_public_key
 from connector.core.peers import Peer
 
 SERVICE_TYPE = "_connector._tcp.local."
-PROTOCOL_VERSION = "1"
+# 2: links are sealed and need pairing. Copies speaking another version are
+# left out of the panel rather than shown and failing.
+PROTOCOL_VERSION = "2"
 LOOKUP_TIMEOUT_MS = 3000
 
 
@@ -58,10 +61,11 @@ class Discovery(QObject):
     peer_added = Signal(object)  # a Peer; sent again if its details change
     peer_removed = Signal(object)  # the Peer that left
 
-    def __init__(self, name: str, port: int) -> None:
+    def __init__(self, name: str, port: int, public_key: str) -> None:
         super().__init__()
         self._name = name
         self._port = port
+        self._public_key = public_key
         self._instance = f"{instance_label(name)}.{SERVICE_TYPE}"
         self._zeroconf: AsyncZeroconf | None = None
         self._browser: AsyncServiceBrowser | None = None
@@ -74,7 +78,8 @@ class Discovery(QObject):
             SERVICE_TYPE,
             self._instance,
             port=self._port,
-            properties={"v": PROTOCOL_VERSION, "name": self._name},
+            # A public key is 44 characters of base64; TXT values can hold 255.
+            properties={"v": PROTOCOL_VERSION, "name": self._name, "pk": self._public_key},
             parsed_addresses=[lan_ip()],
         )
         self._zeroconf = AsyncZeroconf()
@@ -128,11 +133,14 @@ class Discovery(QObject):
         if not addresses:
             return
         props = decode_properties(info.properties)
+        if props.get("v") != PROTOCOL_VERSION or not is_valid_public_key(props.get("pk")):
+            return  # a different version of Connector: we couldn't talk to it
         peer = Peer(
             id=name,
             name=props.get("name") or name.split(".")[0],
             address=addresses[0],
             port=info.port or 0,
+            public_key=props["pk"],
         )
         if self._peers.get(name) == peer:
             return  # nothing new

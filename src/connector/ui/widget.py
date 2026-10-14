@@ -30,6 +30,9 @@ def avatar_color(name: str) -> QColor:
 class PeerRow(QWidget):
     """One peer: avatar and name. Drop a web link on it to send it to them.
 
+    A peer you haven't paired with yet has an outlined avatar, a dimmer name
+    and a small "Pair" label; clicking the row starts pairing.
+
     The hover highlight isn't drawn here but by the panel, so it can glide
     from row to row. The drop highlight is drawn here.
     """
@@ -44,11 +47,17 @@ class PeerRow(QWidget):
     PAD_RIGHT = 14
     NAME_FONT_PX = 14
     MAX_NAME_WIDTH = 150  # longer names are cut off with "…"
+    PAIR_TEXT = "Pair"
+    PAIR_FONT_PX = 11
+    PAIR_PAD = 8  # inside the "Pair" label, left and right
+    PAIR_GAP = 8  # between the name and the label
 
-    def __init__(self, peer: Peer, theme: Theme) -> None:
+    def __init__(self, peer: Peer, theme: Theme, paired: bool) -> None:
         super().__init__()
         self.peer = peer
         self._theme = theme
+        self.paired = False
+        self.set_paired(paired)
 
         # Without this, Qt never offers the row anything being dragged.
         self.setAcceptDrops(True)
@@ -68,15 +77,28 @@ class PeerRow(QWidget):
         # keeps a soft blue glow, so it's clear something is still happening.
         self._sending = False
 
+    def _pair_label_width(self) -> int:
+        if self.paired:
+            return 0
+        text = text_width(self.PAIR_TEXT, ui_font(self.PAIR_FONT_PX, QFont.Weight.DemiBold), self)
+        return self.PAIR_GAP + text + 2 * self.PAIR_PAD
+
     def sizeHint(self) -> QSize:
-        # Exactly wide enough for the avatar and this name, so the panel
-        # can shrink to its widest row.
+        # Exactly wide enough for the avatar, this name and (if unpaired) the
+        # "Pair" label, so the panel can shrink to its widest row.
         name_width = min(text_width(self.peer.name, ui_font(self.NAME_FONT_PX), self), self.MAX_NAME_WIDTH)
-        return QSize(self.PAD_LEFT + self.AVATAR + self.GAP + name_width + self.PAD_RIGHT, self.HEIGHT)
+        width = self.PAD_LEFT + self.AVATAR + self.GAP + name_width + self._pair_label_width() + self.PAD_RIGHT
+        return QSize(width, self.HEIGHT)
 
     def set_peer(self, peer: Peer) -> None:
         self.peer = peer
         self.updateGeometry()  # the name, and with it the width, may have changed
+        self.update()
+
+    def set_paired(self, paired: bool) -> None:
+        self.paired = paired
+        self.setToolTip("" if paired else f"Click to pair with {self.peer.name}")
+        self.updateGeometry()  # the "Pair" label comes or goes
         self.update()
 
     def set_theme(self, theme: Theme) -> None:
@@ -159,28 +181,50 @@ class PeerRow(QWidget):
             p.setPen(QPen(rim, 1))
             p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 10, 10)
 
-        p.setPen(Qt.PenStyle.NoPen)
         size = self.AVATAR
         avatar = QRectF(self.PAD_LEFT, (self.height() - size) / 2, size, size)
         base = avatar_color(self.peer.name)
-        gradient = QLinearGradient(avatar.topLeft(), avatar.bottomLeft())
-        gradient.setColorAt(0, base.lighter(125))
-        gradient.setColorAt(1, base)
-        p.setBrush(gradient)
-        p.drawEllipse(avatar)
-
-        p.setPen(QColor(255, 255, 255))
+        if self.paired:
+            # A filled, glossy circle with a white initial.
+            p.setPen(Qt.PenStyle.NoPen)
+            gradient = QLinearGradient(avatar.topLeft(), avatar.bottomLeft())
+            gradient.setColorAt(0, base.lighter(125))
+            gradient.setColorAt(1, base)
+            p.setBrush(gradient)
+            p.drawEllipse(avatar)
+            p.setPen(QColor(255, 255, 255))
+        else:
+            # Just an outline, with the initial in the same colour: "not yet".
+            p.setPen(QPen(base, 1.6))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(avatar.adjusted(0.8, 0.8, -0.8, -0.8))
+            p.setPen(base)
         p.setFont(ui_font(12, QFont.Weight.DemiBold))
         p.drawText(avatar, Qt.AlignmentFlag.AlignCenter, self.peer.name[:1].upper())
 
-        p.setPen(self._theme.text)
-        p.setFont(ui_font(self.NAME_FONT_PX))
         text_left = avatar.right() + self.GAP
-        text_rect = QRectF(text_left, 0, self.width() - text_left - self.PAD_RIGHT, self.height())
+        text_right = self.width() - self.PAD_RIGHT - self._pair_label_width()
+        name_color = QColor(self._theme.text)
+        name_color.setAlphaF(1.0 if self.paired else 0.7)
+        p.setPen(name_color)
+        p.setFont(ui_font(self.NAME_FONT_PX))
+        text_rect = QRectF(text_left, 0, text_right - text_left, self.height())
         name = p.fontMetrics().elidedText(
             self.peer.name, Qt.TextElideMode.ElideRight, int(text_rect.width())
         )
         p.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, name)
+
+        if not self.paired:
+            label = QRectF(text_right + self.PAIR_GAP, (self.height() - 20) / 2,
+                           self._pair_label_width() - self.PAIR_GAP, 20)
+            fill = QColor(self._theme.hover)
+            fill.setAlphaF(min(1.0, fill.alphaF() * 2))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(fill)
+            p.drawRoundedRect(label, 10, 10)
+            p.setPen(self._theme.text)
+            p.setFont(ui_font(self.PAIR_FONT_PX, QFont.Weight.DemiBold))
+            p.drawText(label, Qt.AlignmentFlag.AlignCenter, self.PAIR_TEXT)
 
 
 class EmptyRow(QWidget):
@@ -301,6 +345,7 @@ class PeerWidget(GlassWindow):
 
     collapse_requested = Signal()
     send_requested = Signal(object, object)  # (Peer, Link): a link was dropped on a peer
+    pair_requested = Signal(object)  # a Peer: an unpaired row was clicked
 
     def __init__(self) -> None:
         super().__init__()
@@ -354,11 +399,11 @@ class PeerWidget(GlassWindow):
 
     # --- peers ----------------------------------------------------------
 
-    def add_peer(self, peer: Peer) -> None:
+    def add_peer(self, peer: Peer, paired: bool) -> None:
         """Show a peer, or update its row if it's already shown."""
         row = self._rows.get(peer.id)
         if row is None:
-            row = PeerRow(peer, self.theme)
+            row = PeerRow(peer, self.theme, paired)
             # partial() fixes `row` now. A lambda would look `row` up only
             # when called, and by then it could be a different row.
             row.hovered.connect(partial(self._glide_to, row))
@@ -366,9 +411,22 @@ class PeerWidget(GlassWindow):
             self._rows[peer.id] = row
         else:
             row.set_peer(peer)
+            row.set_paired(paired)
             self._rows_layout.removeWidget(row)  # re-inserted below, in case its name moved it
         self._rows_layout.insertWidget(self._position_for(peer), row)
         self._rows_changed()
+
+    def set_paired(self, public_key: str) -> None:
+        """Show a peer as paired: everywhere it appears, by its key."""
+        for row in self._rows.values():
+            if row.peer.public_key == public_key:
+                row.set_paired(True)
+
+    def on_clicked(self, pos) -> None:
+        # A click (not a drag) on an unpaired row starts pairing.
+        row = self.childAt(pos)
+        if isinstance(row, PeerRow) and not row.paired:
+            self.pair_requested.emit(row.peer)
 
     def remove_peer(self, peer: Peer) -> None:
         row = self._rows.pop(peer.id, None)

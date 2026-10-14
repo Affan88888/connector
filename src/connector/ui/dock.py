@@ -9,6 +9,7 @@ from PySide6.QtGui import QColor, QGuiApplication, QPainter
 from connector.core.links import Link
 from connector.ui.glass import Edge, GlassWindow
 from connector.ui.links import link_from_drag
+from connector.ui.pairing import PairingCard
 from connector.ui.style import HoverFade, draw_chevron
 from connector.ui.toast import Toast
 from connector.ui.widget import PeerWidget
@@ -123,6 +124,7 @@ class SideDock(QObject):
         self.panel = PeerWidget()
         self.tab = EdgeTab()
         self.toast = Toast()
+        self.card = PairingCard()
         self.panel.collapse_requested.connect(self.collapse)
         self.tab.clicked.connect(self.expand)
         self.tab.link_held.connect(self.expand)
@@ -146,10 +148,19 @@ class SideDock(QObject):
         )
         self.panel.show()
 
+    def beside(self) -> QRect:
+        """Where notes like the toast and the pairing card go next to: the
+        panel, or the tab while the panel is hidden."""
+        return self.panel.geometry() if self.panel.isVisible() else self.tab.geometry()
+
     def show_toast(self, sender: str, link: Link) -> None:
         """Say who sent a link, beside the panel (or the tab, if it's hidden)."""
-        beside = self.panel.geometry() if self.panel.isVisible() else self.tab.geometry()
-        self.toast.show_link(sender, link, beside)
+        if self.card.waiting:
+            # The card is asking a question: don't cover it, go next to it.
+            self.toast.show_link(sender, link, self.card.geometry())
+            return
+        self.card.close_card()  # a leftover "Paired with…" message makes way
+        self.toast.show_link(sender, link, self.beside())
 
     def collapse(self) -> None:
         if self._animation is not None:  # already moving
